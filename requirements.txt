@@ -10,3 +10,5 @@ scikit-learn
 numpy
 pandas
 requests
+torch
+torchvision
