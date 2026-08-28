@@ -2,6 +2,7 @@ streamlit
 python-dotenv
 google-genai
 pypdf
+PyMuPDF
 sentence-transformers
 faiss-cpu
 scikit-learn
