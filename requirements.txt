@@ -3,6 +3,7 @@ python-dotenv
 google-genai
 pypdf
 PyMuPDF
+pytesseract
 sentence-transformers
 faiss-cpu
 scikit-learn
