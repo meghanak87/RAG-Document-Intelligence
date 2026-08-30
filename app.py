@@ -1,15 +1,12 @@
-import os
-import re
-import time
 import hashlib
+import os
 import pickle
+import re
 import tempfile
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
-from dotenv import load_dotenv
-from google import genai
 
 from chunker import create_chunks
 from model_comparison import (
@@ -24,10 +21,8 @@ from model_comparison import (
 # CONFIG
 # =========================================================
 
-load_dotenv(".env", override=True)
-
 st.set_page_config(
-    page_title="RAG Document Intelligence",
+    page_title="RAG Embedding Comparison",
     page_icon="🤖",
     layout="wide",
 )
@@ -45,10 +40,9 @@ defaults = {
     "documents": {},
     "selected_document": None,
     "history": {},
-    "comparison_question": {},
-    "comparison_answer": {},
-    "comparison_source": {},
+    "eval_questions": {},
     "eval_results": {},
+    "comparison_history": {},
 }
 
 for key, value in defaults.items():
@@ -57,13 +51,12 @@ for key, value in defaults.items():
 
 
 # =========================================================
-# PDF CACHE
+# PERSISTENT PDF CACHE
 # =========================================================
 
 def file_key(uploaded_file):
-    return hashlib.sha256(
-        uploaded_file.getvalue()
-    ).hexdigest()
+    data = uploaded_file.getvalue()
+    return hashlib.sha256(data).hexdigest()
 
 
 def cache_path(key):
@@ -71,24 +64,14 @@ def cache_path(key):
 
 
 def load_cached_documents():
-
     for path in STORAGE_DIR.glob("*.pkl"):
-
         try:
-
             with open(path, "rb") as f:
                 item = pickle.load(f)
-
-            if (
-                "name" in item
-                and "chunks" in item
-            ):
-                st.session_state.documents[
-                    item["name"]
-                ] = item["chunks"]
-
+            name = item["name"]
+            st.session_state.documents[name] = item["chunks"]
         except Exception:
-            continue
+            pass
 
 
 if not st.session_state.documents:
@@ -96,52 +79,30 @@ if not st.session_state.documents:
 
 
 def process_pdf(uploaded_file):
-
     key = file_key(uploaded_file)
     path = cache_path(key)
 
     if path.exists():
-
         with open(path, "rb") as f:
             item = pickle.load(f)
-
-        return (
-            item["name"],
-            item["chunks"],
-            False,
-        )
+        return item["name"], item["chunks"], key, False
 
     with tempfile.NamedTemporaryFile(
         delete=False,
         suffix=".pdf",
     ) as f:
-
-        f.write(
-            uploaded_file.getvalue()
-        )
-
+        f.write(uploaded_file.getvalue())
         pdf_path = f.name
 
     try:
-
-        chunks = create_chunks(
-            pdf_path
-        )
-
+        chunks = create_chunks(pdf_path)
     finally:
-
         try:
             os.remove(pdf_path)
         except OSError:
             pass
 
-    if not chunks:
-        raise ValueError(
-            "No text could be extracted from the PDF."
-        )
-
     with open(path, "wb") as f:
-
         pickle.dump(
             {
                 "name": uploaded_file.name,
@@ -150,326 +111,100 @@ def process_pdf(uploaded_file):
             f,
         )
 
-    return (
-        uploaded_file.name,
-        chunks,
-        True,
-    )
+    return uploaded_file.name, chunks, key, True
 
 
 def remove_pdf(name):
-
+    # Remove matching persistent cache by checking stored names.
     for path in STORAGE_DIR.glob("*.pkl"):
-
         try:
-
             with open(path, "rb") as f:
                 item = pickle.load(f)
-
             if item.get("name") == name:
-                path.unlink(
-                    missing_ok=True
-                )
-
+                path.unlink(missing_ok=True)
         except Exception:
-            continue
+            pass
 
-    st.session_state.documents.pop(
-        name,
-        None,
-    )
+    st.session_state.documents.pop(name, None)
+    st.session_state.history.pop(name, None)
+    st.session_state.eval_questions.pop(name, None)
+    st.session_state.eval_results.pop(name, None)
 
-    st.session_state.history.pop(
-        name,
-        None,
-    )
-
-    st.session_state.comparison_question.pop(
-        name,
-        None,
-    )
-
-    st.session_state.comparison_answer.pop(
-        name,
-        None,
-    )
-
-    st.session_state.comparison_source.pop(
-        name,
-        None,
-    )
-
-    st.session_state.eval_results.pop(
-        name,
-        None,
-    )
-
-    names = list(
-        st.session_state.documents
-    )
-
-    st.session_state.selected_document = (
-        names[0] if names else None
-    )
+    names = list(st.session_state.documents)
+    st.session_state.selected_document = names[0] if names else None
 
 
 # =========================================================
-# TEXT HELPERS
+# CONCISE EXTRACTIVE ANSWER
 # =========================================================
 
 def clean_text(text):
-
-    return re.sub(
-        r"\s+",
-        " ",
-        str(text or ""),
-    ).strip()
+    return re.sub(r"\s+", " ", str(text or "")).strip()
 
 
-def chunk_text(chunk):
-
-    if isinstance(chunk, dict):
-        return clean_text(
-            chunk.get("text", "")
-        )
-
-    return clean_text(chunk)
-
-
-def chunk_page(chunk):
-
-    if isinstance(chunk, dict):
-        return chunk.get(
-            "page",
-            1,
-        )
-
-    return 1
-
-
-# =========================================================
-# RAG ANSWER GENERATION
-# =========================================================
-
-def generate_concise_answer(
-    question,
-    retrieved_chunks,
-):
-
-    if not retrieved_chunks:
-
-        return (
-            "The answer is not available "
-            "in the PDF."
-        )
-
-    context_parts = []
-
-    for item in retrieved_chunks:
-
-        text = clean_text(
-            item.get("text", "")
-        )
-
-        page = item.get(
-            "page",
-            1,
-        )
-
-        if text:
-
-            context_parts.append(
-                f"Page {page}:\n{text}"
-            )
-
-    context = "\n\n".join(
-        context_parts
-    )
+def extract_answer(question, context):
+    q = clean_text(question).lower()
+    context = clean_text(context)
 
     if not context:
+        return "Answer not found in the document."
 
-        return (
-            "The answer is not available "
-            "in the PDF."
+    # Exact-value fields
+    if "cgpa" in q:
+        m = re.search(r"cgpa\s*[:\-]?\s*(\d+(?:\.\d+)?)", context, re.I)
+        if m:
+            return m.group(1)
+
+    if "linkedin" in q:
+        urls = re.findall(r"https?://[^\s)]+", context, re.I)
+        for url in urls:
+            if "linkedin.com" in url.lower():
+                return url.rstrip(".,;")
+        return "LinkedIn link not found in the retrieved source."
+
+    if "email" in q or "mail id" in q:
+        m = re.search(
+            r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+            context,
         )
+        if m:
+            return m.group(0)
 
-    try:
+    if "percentage" in q or "percent" in q:
+        matches = re.findall(r"\b\d+(?:\.\d+)?\s*%", context)
+        if matches:
+            return matches[-1]
 
-        client = genai.Client()
+    if "phone" in q or "mobile" in q or "contact number" in q:
+        m = re.search(r"(?:\+?\d[\d\s().-]{8,}\d)", context)
+        if m:
+            return clean_text(m.group(0))
 
-        prompt = f"""
-You are a precise PDF question-answering system.
+    # Sentence-level extraction for normal questions
+    sentences = [
+        s.strip()
+        for s in re.split(r"(?<=[.!?])\s+", context)
+        if s.strip()
+    ]
 
-Answer the user's question using ONLY the
-information contained in the PDF evidence below.
+    q_words = set(re.findall(r"[a-z0-9+#]+", q))
+    scored = []
 
-Rules:
+    for sentence in sentences:
+        words = set(re.findall(r"[a-z0-9+#]+", sentence.lower()))
+        overlap = len(q_words & words)
+        if overlap:
+            scored.append((overlap, -len(sentence), sentence))
 
-1. Do not use outside knowledge.
-2. Do not invent information.
-3. Do not summarize the entire document.
-4. Answer exactly what the question asks.
-5. Give a concise answer.
-6. If the question asks for a list, provide the list.
-7. If the question asks for a name, give the name.
-8. If the question asks for a number, give the number.
-9. If several items are requested, include all supported items.
-10. If the evidence does not contain the answer,
-    say exactly:
-    "The answer is not available in the PDF."
-11. Do not mention the retrieval process.
-12. Do not write a professional summary unless the
-    question explicitly asks for one.
-13. Do not add information that is not present in
-    the evidence.
-
-PDF EVIDENCE:
-
-{context}
-
-USER QUESTION:
-
-{question}
-
-CONCISE ANSWER:
-"""
-
-        response = client.models.generate_content(
-            model="gemini-3.6-flash",
-            contents=prompt,
-        )
-
-        answer = clean_text(
-            response.text
-        )
-
-        if answer:
+    if scored:
+        scored.sort(reverse=True)
+        answer = scored[0][2]
+        if len(answer) <= 350:
             return answer
 
-    except Exception as e:
-
-        # Safe deterministic fallback.
-        # This prevents the application from crashing
-        # if the answer-generation service is unavailable.
-        pass
-
-    return deterministic_fallback(
-        question,
-        retrieved_chunks,
-    )
-
-
-# =========================================================
-# DETERMINISTIC FALLBACK
-# =========================================================
-
-def deterministic_fallback(
-    question,
-    retrieved_chunks,
-):
-
-    question_words = set(
-        re.findall(
-            r"[a-z0-9+#.]+",
-            question.lower(),
-        )
-    )
-
-    stop_words = {
-        "what",
-        "which",
-        "who",
-        "where",
-        "when",
-        "how",
-        "why",
-        "is",
-        "are",
-        "was",
-        "were",
-        "the",
-        "a",
-        "an",
-        "of",
-        "for",
-        "in",
-        "on",
-        "to",
-        "from",
-        "and",
-        "or",
-        "with",
-        "does",
-        "do",
-        "did",
-        "can",
-        "could",
-        "tell",
-        "me",
-        "give",
-        "about",
-    }
-
-    question_words -= stop_words
-
-    candidates = []
-
-    for item in retrieved_chunks:
-
-        text = clean_text(
-            item.get("text", "")
-        )
-
-        if not text:
-            continue
-
-        sentences = re.split(
-            r"(?<=[.!?])\s+",
-            text,
-        )
-
-        for sentence in sentences:
-
-            sentence = clean_text(
-                sentence
-            )
-
-            if not sentence:
-                continue
-
-            words = set(
-                re.findall(
-                    r"[a-z0-9+#.]+",
-                    sentence.lower(),
-                )
-            )
-
-            score = len(
-                question_words & words
-            )
-
-            if score > 0:
-
-                candidates.append(
-                    (
-                        score,
-                        -len(sentence),
-                        sentence,
-                    )
-                )
-
-    if candidates:
-
-        candidates.sort(
-            reverse=True
-        )
-
-        return candidates[0][2][:500]
-
-    return (
-        "The answer is not available "
-        "in the PDF."
-    )
+    # Never dump a whole long chunk.
+    words = context.split()
+    return " ".join(words[:45]) + ("..." if len(words) > 45 else "")
 
 
 # =========================================================
@@ -477,10 +212,7 @@ def deterministic_fallback(
 # =========================================================
 
 with st.sidebar:
-
-    st.title(
-        "🤖 RAG Document Intelligence"
-    )
+    st.title("🤖 RAG Document Intelligence")
 
     page = st.radio(
         "Pages",
@@ -494,19 +226,10 @@ with st.sidebar:
     st.divider()
 
     if st.session_state.documents:
+        names = list(st.session_state.documents)
 
-        names = list(
-            st.session_state.documents.keys()
-        )
-
-        if (
-            st.session_state.selected_document
-            not in names
-        ):
-
-            st.session_state.selected_document = (
-                names[0]
-            )
+        if st.session_state.selected_document not in names:
+            st.session_state.selected_document = names[0]
 
         selected = st.selectbox(
             "Current PDF",
@@ -515,241 +238,147 @@ with st.sidebar:
                 st.session_state.selected_document
             ),
         )
-
-        st.session_state.selected_document = (
-            selected
-        )
+        st.session_state.selected_document = selected
 
         if st.button(
             "🗑️ Remove selected PDF",
-            width="stretch",
+            use_container_width=True,
         ):
-
             remove_pdf(selected)
             st.rerun()
 
+    else:
+        st.caption("No PDF loaded.")
+
 
 # =========================================================
-# UPLOAD
+# UPLOAD AREA
 # =========================================================
 
-st.title(
-    "🤖 RAG Document Intelligence"
-)
+st.title("🤖 RAG Document Intelligence")
 
 uploaded_file = st.file_uploader(
     "Upload a PDF",
     type=["pdf"],
 )
 
-
 if uploaded_file is not None:
+    name, chunks, key, newly_processed = process_pdf(uploaded_file)
 
-    try:
+    if name not in st.session_state.documents:
+        st.session_state.documents[name] = chunks
 
-        (
-            name,
-            chunks,
-            newly_processed,
-        ) = process_pdf(
-            uploaded_file
+    st.session_state.selected_document = name
+
+    if newly_processed:
+        st.success(
+            f"Processed {name}: {len(chunks)} chunks created."
         )
-
-        st.session_state.documents[
-            name
-        ] = chunks
-
-        st.session_state.selected_document = (
-            name
+    else:
+        st.success(
+            f"{name} is already stored. No re-processing needed."
         )
-
-        if newly_processed:
-
-            st.success(
-                f"Processed {name} — "
-                f"{len(chunks)} chunks created."
-            )
-
-        else:
-
-            st.success(
-                f"{name} is already stored. "
-                "No re-processing needed."
-            )
-
-    except Exception as e:
-
-        st.error(
-            f"PDF processing failed: {e}"
-        )
-
-        st.stop()
 
 
 if not st.session_state.documents:
-
-    st.info(
-        "Upload a PDF to begin."
-    )
-
+    st.info("Upload a PDF to begin.")
     st.stop()
 
 
-document_name = (
-    st.session_state.selected_document
-)
-
-chunks = st.session_state.documents[
-    document_name
-]
+document_name = st.session_state.selected_document
+chunks = st.session_state.documents[document_name]
 
 
 # =========================================================
-# PAGE 1 — ASK QUESTIONS
+# PAGE 1: ASK QUESTIONS
 # =========================================================
 
 if page == "📄 Ask Questions":
 
-    st.header(
-        "💬 Ask a Question"
-    )
+    st.header("💬 Ask a Question")
 
     model_name = st.selectbox(
         "Embedding model",
-        list(MODELS.keys()),
+        list(MODELS),
         key=f"qa_model_{document_name}",
     )
 
     question = st.text_input(
         "Question",
-        placeholder=(
-            "Ask anything that is present "
-            "in the uploaded PDF..."
-        ),
+        placeholder="Example: What is the CGPA?",
     )
 
     if st.button(
         "🔍 Get Answer",
         type="primary",
-        width="stretch",
+        use_container_width=True,
     ):
-
         if not question.strip():
-
-            st.warning(
-                "Enter a question."
-            )
-
+            st.warning("Enter a question.")
             st.stop()
 
-        with st.spinner(
-            f"Retrieving relevant information "
-            f"with {model_name}..."
-        ):
-
+        with st.spinner(f"Searching with {model_name}..."):
             result = retrieve_with_model(
                 model_name,
                 question,
                 chunks,
-                top_k=5,
+                top_k=3,
             )
 
         if not result:
 
-            st.error(
-                "No relevant information was "
-                "retrieved from this PDF."
-            )
+            st.error("No relevant information found.")
 
         else:
 
-            with st.spinner(
-                "Preparing concise answer..."
-            ):
-
-                answer = generate_concise_answer(
-                    question,
-                    result["retrieved"],
-                )
-
-            st.subheader(
-                "🤖 Answer"
+            answer = extract_answer(
+                question,
+                result["source"],
             )
 
-            st.success(
-                answer
-            )
+            st.subheader("🤖 Answer")
+            st.success(answer)
 
             st.caption(
                 f"Model: {model_name} | "
-                f"Top source page: "
-                f"{result['page']} | "
-                f"Similarity: "
-                f"{result['similarity']:.4f}"
+                f"Page: {result['page']} | "
+                f"Similarity: {result['similarity']:.4f}"
             )
-
-            # -------------------------------------------------
-            # SAVE QUESTION FOR PAGE 2
-            # -------------------------------------------------
-
-            st.session_state.comparison_question[
-                document_name
-            ] = question.strip()
-
-            st.session_state.comparison_answer[
-                document_name
-            ] = answer
-
-            st.session_state.comparison_source[
-                document_name
-            ] = result["retrieved"]
-
-            # New question means previous comparison
-            # is no longer valid.
-            st.session_state.eval_results.pop(
-                document_name,
-                None,
-            )
-
-            # -------------------------------------------------
-            # HISTORY
-            # -------------------------------------------------
 
             st.session_state.history.setdefault(
                 document_name,
                 [],
-            ).append(
-                {
-                    "question":
-                        question.strip(),
+            ).append({
+                "question": question,
+                "answer": answer,
+                "model": model_name,
+                "page": result["page"],
+            })
 
-                    "answer":
-                        answer,
+            with st.expander("📑 Review source"):
+                st.write(result["source"])
 
-                    "model":
-                        model_name,
+            st.subheader("🤖 Answer")
+            st.success(answer)
 
-                    "page":
-                        result["page"],
-                }
+            st.caption(
+                f"Model: {model_name} | "
+                f"Page: {result['page']} | "
+                f"Similarity: {result['similarity']:.4f}"
             )
 
-            with st.expander(
-                "📑 Review retrieved PDF evidence"
-            ):
+            st.session_state.history.setdefault(
+                document_name,
+                [],
+            ).append({
+                "question": question,
+                "answer": answer,
+                "model": model_name,
+                "page": result["page"],
+            })
 
-                for item in result["retrieved"]:
-
-                    st.markdown(
-                        f"**Rank {item['rank']} | "
-                        f"Page {item['page']} | "
-                        f"Similarity "
-                        f"{item['score']:.4f}**"
-                    )
-
-                    st.write(
-                        item["text"]
-                    )
+            with st.expander("📑 Review source"):
+                st.write(result["source"])
 
     history = st.session_state.history.get(
         document_name,
@@ -757,87 +386,75 @@ if page == "📄 Ask Questions":
     )
 
     if history:
-
         st.divider()
-
-        st.subheader(
-            "📚 Previous Questions"
-        )
+        st.subheader("📚 Previous Questions")
 
         for item in reversed(history):
-
-            with st.expander(
-                item["question"]
-            ):
-
-                st.write(
-                    f"**Answer:** "
-                    f"{item['answer']}"
-                )
-
+            with st.expander(item["question"]):
+                st.write(f"**Answer:** {item['answer']}")
                 st.caption(
-                    f"{item['model']} • "
-                    f"Page {item['page']}"
+                    f"{item['model']} • Page {item['page']}"
                 )
 
 
 # =========================================================
-# PAGE 2 — MODEL COMPARISON
-# =========================================================
+# PAGE 2: MODEL COMPARISON
 
 elif page == "📊 Model Comparison":
 
-    st.header(
-        "📊 Model Comparison"
-    )
-
+    st.header("📊 Model Comparison")
     st.write(
         f"Comparison for **{document_name}**"
     )
 
-    saved_question = (
-        st.session_state.comparison_question.get(
-            document_name,
-            "",
-        )
+    # Use questions already asked on Page 1.
+    # This keeps the original simple workflow: ask a question -> compare models.
+    history = st.session_state.history.get(
+        document_name,
+        [],
     )
 
-    saved_answer = (
-        st.session_state.comparison_answer.get(
-            document_name,
-            "",
+    if not history:
+        st.info(
+            "Ask at least one question on the 📄 Ask Questions page first. "
+            "The question and answer will automatically appear here."
         )
-    )
-
-    if not saved_question:
-
-        st.warning(
-            "First ask a question on Page 1. "
-            "This page automatically uses that "
-            "same question."
-        )
-
         st.stop()
 
-    st.subheader(
-        "Question from Page 1"
-    )
+    # Build evaluation set from previously asked questions.
+    # The answer generated from the selected model is used as the reference
+    # evidence for the prototype's comparison logic.
+    evaluation_questions = []
+    seen = set()
 
-    st.info(
-        saved_question
-    )
+    for item in history:
+        q_text = str(item.get("question", "")).strip()
+        a_text = str(item.get("answer", "")).strip()
 
-    st.subheader(
-        "Reference answer from Page 1"
-    )
+        if q_text and a_text and q_text not in seen:
+            evaluation_questions.append({
+                "question": q_text,
+                "answer": a_text,
+            })
+            seen.add(q_text)
 
-    st.success(
-        saved_answer
-    )
-
+    st.subheader("📋 Questions tested")
     st.caption(
-        "The question is automatically carried "
-        "from Page 1. You do not need to enter it again."
+        "Questions are automatically collected from the questions asked on Page 1. "
+        "You do not need to enter them again."
+    )
+
+    question_rows = []
+    for i, item in enumerate(evaluation_questions, start=1):
+        question_rows.append({
+            "#": i,
+            "Question": item["question"],
+        })
+
+    st.dataframe(
+        pd.DataFrame(question_rows),
+        use_container_width=True,
+        hide_index=True,
     )
 
     st.divider()
@@ -845,36 +462,19 @@ elif page == "📊 Model Comparison":
     if st.button(
         "🚀 Compare All Models",
         type="primary",
-        width="stretch",
+        use_container_width=True,
     ):
-
-        evaluation_questions = [
-            {
-                "question":
-                    saved_question,
-
-                "answer":
-                    saved_answer,
-            }
-        ]
-
         with st.spinner(
-            "Testing all embedding models "
-            "on the same PDF and same question..."
+            "Testing all embedding models on the same PDF and questions..."
         ):
-
             results = evaluate_all_models(
                 chunks,
                 evaluation_questions,
             )
 
-        st.session_state.eval_results[
-            document_name
-        ] = results
-
+        st.session_state.eval_results[document_name] = results
         st.success(
-            "Comparison completed for this PDF "
-            "and this question."
+            f"Comparison completed for {len(evaluation_questions)} question(s)."
         )
 
     results = st.session_state.eval_results.get(
@@ -883,233 +483,187 @@ elif page == "📊 Model Comparison":
     )
 
     if results:
-
         st.divider()
-
-        st.subheader(
-            "📈 Comparison Results"
-        )
+        st.subheader("📈 Comparison Results")
 
         rows = []
-
-        for result in results:
-
-            rows.append(
-                {
-                    "Model":
-                        result["model"],
-
-                    "Top-1 Similarity":
-                        result["avg_similarity"],
-
-                    "Top-3 Similarity":
-                        result["top3_similarity"],
-
-                    "Average Time (s)":
-                        result["avg_time"],
-                }
-            )
-
-        df = pd.DataFrame(
-            rows
-        )
+        for r in results:
+            rows.append({
+                "Model": r["model"],
+                "Accuracy (%)": round(r.get("accuracy", 0.0), 2),
+                "Top-3 Accuracy (%)": round(r.get("top3_accuracy", 0.0), 2),
+                "Top-1 Similarity": round(r.get("avg_similarity", 0.0), 4),
+                "Top-3 Similarity": round(r.get("top3_similarity", 0.0), 4),
+                "Average Time (s)": round(r.get("avg_time", 0.0), 4),
+                "Questions Won": r.get("win_count", 0),
+            })
 
         st.dataframe(
-            df,
-            width="stretch",
+            pd.DataFrame(rows),
+            use_container_width=True,
             hide_index=True,
         )
 
         st.caption(
-            "All models are tested on the same PDF and the same question. "
-            "Higher retrieval similarity indicates stronger retrieval for this question."
+            "Each model is evaluated independently on the same PDF and the same questions. "
+            "The recommendation is calculated from the measured comparison results."
         )
 
-        st.divider()
-
-        st.subheader(
-            "🔎 Review Each Model"
+        # ---------------------------------------------------------
+        # QUESTION-WISE WINNERS
+        # ---------------------------------------------------------
+        question_winners = results[0].get(
+            "question_winners",
+            [],
         )
 
-        selected_model = st.selectbox(
-            "Select model to review",
-            [
-                result["model"]
-                for result in results
-            ],
-            key=f"review_{document_name}",
-        )
+        if question_winners:
+            st.divider()
+            st.subheader("🏆 Best Model for Each Question")
 
-        selected_result = next(
-            result
-            for result in results
-            if result["model"]
-            == selected_model
-        )
+            winner_rows = []
+            for item in question_winners:
+                winner_rows.append({
+                    "Question": item.get("question", ""),
+                    "Best Model": item.get("best_model", ""),
+                    "Top-1 Similarity": round(
+                        item.get("similarity", 0.0), 4
+                    ),
+                })
 
-        details = (
-            selected_result["details"]
-        )
-
-        for detail in details:
-            st.markdown("### Question")
-            st.write(detail.get("question", saved_question))
-
-            st.markdown("**Reference answer:**")
-            st.write(detail.get("expected", saved_answer))
-
-            col1, col2, col3 = st.columns(3)
-
-            with col1:
-                st.metric(
-                    "Top-1 Similarity",
-                    f"{detail.get('similarity', 0.0):.4f}",
-                )
-
-            with col2:
-                st.metric(
-                    "Top-3 Similarity",
-                    f"{detail.get('top3_similarity', 0.0):.4f}",
-                )
-
-            with col3:
-                st.metric(
-                    "Retrieval Time",
-                    f"{detail.get('time', 0.0):.4f}s",
-                )
-
-            st.caption(
-                f"Retrieved page: {detail.get('page', 'N/A')}"
+            st.dataframe(
+                pd.DataFrame(winner_rows),
+                use_container_width=True,
+                hide_index=True,
             )
 
-            st.markdown("**Retrieved Evidence:**")
-            st.write(
-                detail.get(
-                    "source",
-                    "No evidence retrieved.",
-                )
+        # ---------------------------------------------------------
+        # OVERALL WIN COUNT
+        # ---------------------------------------------------------
+        win_counts = results[0].get(
+            "win_counts",
+            {},
+        )
+
+        if win_counts:
+            st.divider()
+            st.subheader("📊 Overall Model Performance")
+
+            total_questions = len(question_winners)
+            performance_rows = []
+
+            for model_name in MODELS:
+                performance_rows.append({
+                    "Model": model_name,
+                    "Questions Won": win_counts.get(
+                        model_name,
+                        0,
+                    ),
+                })
+
+            performance_df = (
+                pd.DataFrame(performance_rows)
+                .sort_values("Questions Won", ascending=False)
+                .reset_index(drop=True)
             )
 
-# =========================================================
-# PAGE 3 — MODEL RECOMMENDATION
+            st.dataframe(
+                performance_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            overall_best = results[0].get(
+                "overall_best_model"
+            )
+
+            if overall_best:
+                st.success(
+                    f"🏆 Overall Best Model: **{overall_best}**"
+                )
+                st.caption(
+                    f"Based on {total_questions} evaluated question(s) for this PDF. "
+                    "The winner is recalculated whenever the comparison is run."
+                )
+
+
+# PAGE 3: MODEL RECOMMENDATION
 # =========================================================
 
 else:
 
-    st.header(
-        "🏆 Model Recommendation"
-    )
+    st.header("🏆 Model Recommendation")
 
-    saved_question = (
-        st.session_state.comparison_question.get(
-            document_name,
-            "",
-        )
-    )
-
-    results = (
-        st.session_state.eval_results.get(
-            document_name,
-            [],
-        )
-    )
-
-    if not saved_question:
-
-        st.warning(
-            "Ask a question on Page 1 first."
-        )
-
-        st.stop()
-
-    st.subheader(
-        "Question evaluated"
-    )
-
-    st.info(
-        saved_question
+    results = st.session_state.eval_results.get(
+        document_name,
+        [],
     )
 
     if not results:
-
         st.warning(
-            "Run 'Compare All Models' on Page 2 "
-            "before viewing the recommendation."
+            "Run Model Comparison first for this PDF."
         )
-
         st.stop()
 
-    best = recommend_model(
-        results
-    )
+    recommendation = recommend_model(results)
 
-    if best is None:
-
-        st.error(
-            "No recommendation is available."
-        )
-
+    if recommendation is None:
+        st.error("No evaluation result available.")
         st.stop()
 
     st.success(
-        f"🏆 Recommended model for "
-        f"**{document_name}**: "
-        f"**{best['model']}**"
-    )
-
-    st.subheader(
-        "Why this model?"
+        f"🏆 Recommended model for **{document_name}**: "
+        f"**{recommendation['model']}**"
     )
 
     st.write(
         f"""
-The recommendation is calculated from the
-actual comparison results for **this PDF**
-and the same question asked on Page 1.
+**Why this model was selected**
 
-- **Top-1 Similarity:** {best["avg_similarity"]:.4f}
-- **Top-3 Similarity:** {best["top3_similarity"]:.4f}
-- **Average Retrieval Time:** {best['avg_time']:.4f} seconds
+- Questions Won: **{recommendation.get('win_count', 0)}**
+- Accuracy: **{recommendation['accuracy']:.2f}%**
+- Top-3 Accuracy: **{recommendation['top3_accuracy']:.2f}%**
+- Average Similarity: **{recommendation['avg_similarity']:.4f}**
+- Average Time: **{recommendation['avg_time']:.4f} seconds**
+
+Question wins are the primary criterion for the overall recommendation.
+Accuracy, Top-3 accuracy, similarity and speed are used as tie-breakers.
 """
     )
 
     st.info(
-        "There is no permanently fixed best model. "
-        "The model with the strongest measured "
-        "evaluation result for the current PDF/question "
-        "is recommended."
+        "This recommendation is calculated from the evaluation "
+        "results of the currently selected PDF. Another PDF can "
+        "produce a different winner."
     )
 
-    st.subheader(
-        "📊 Complete Comparison"
+    st.subheader("🔎 Review individual model")
+
+    selected_review = st.selectbox(
+        "Model",
+        [r["model"] for r in results],
     )
 
-    rows = []
+    selected_result = next(
+        r for r in results
+        if r["model"] == selected_review
+    )
 
-    for result in results:
+    review_rows = []
 
-        rows.append(
-            {
-                "Model":
-                    result["model"],
-
-                "Top-1 Similarity":
-                    result.get("avg_similarity", 0.0),
-
-                "Top-3 Similarity":
-                    result.get("top3_similarity", 0.0),
-
-                "Average Similarity":
-                    result["avg_similarity"],
-
-                "Average Time (s)":
-                    result["avg_time"],
-            }
-        )
+    for d in selected_result["details"]:
+        review_rows.append({
+    "Question": d.get("question", ""),
+    "Expected": d.get("expected", ""),
+    "Top-1": "Correct" if d.get("evidence_match", False) else "Wrong",
+    "Top-3": "Correct" if d.get("top3_evidence_match", False) else "Wrong",
+    "Similarity": round(d.get("similarity", 0.0), 4),
+    "Page": d.get("page", ""),
+    })
 
     st.dataframe(
-        pd.DataFrame(rows),
-        width="stretch",
+        pd.DataFrame(review_rows),
+        use_container_width=True,
         hide_index=True,
     )
 
@@ -1119,10 +673,7 @@ and the same question asked on Page 1.
 # =========================================================
 
 st.divider()
-
 st.caption(
-    "RAG Embedding Comparison • "
-    "PDF-specific evaluation • "
-    "Same question across all models • "
-    "No hardcoded winner"
+    "PDF-specific RAG evaluation • No hardcoded model winner • "
+    "Concise extractive answers"
 )
