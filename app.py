@@ -15,6 +15,7 @@ from model_comparison import (
     evaluate_all_models,
     recommend_model,
 )
+st.success("App imports loaded successfully")
 
 
 # =========================================================
